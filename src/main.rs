@@ -16,6 +16,9 @@ const BUILD_DATE: &str = env!("BUILD_DATE");
 
 const CLAP_VERSION: &str = formatcp!("{GIT_VERSION} [{GIT_BRANCH}, {GIT_HASH}, {BUILD_DATE}]");
 
+static UNSUPPORTED_COLOR_TYPES: [ColorType; 2] = [ColorType::Rgb32F, ColorType::Rgba32F];
+static U16_SCALAR: f32 = 65536.0;
+
 #[derive(clap::ValueEnum, Clone, Default)]
 enum Blend {
 	White,
@@ -39,10 +42,6 @@ struct Args {
 }
 
 fn preflight_checks(black: &DynamicImage, white: &DynamicImage) -> Result<(), Error> {
-	let unsupported_color_types = [ColorType::Rgb32F, ColorType::Rgba32F];
-	let black_color = black.color();
-	let white_color = white.color();
-
 	if black.dimensions() != white.dimensions() {
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
@@ -50,7 +49,10 @@ fn preflight_checks(black: &DynamicImage, white: &DynamicImage) -> Result<(), Er
 		));
 	}
 
-	if unsupported_color_types.contains(&black_color) || unsupported_color_types.contains(&white_color) {
+	let black_color = black.color();
+	let white_color = white.color();
+
+	if UNSUPPORTED_COLOR_TYPES.contains(&black_color) || UNSUPPORTED_COLOR_TYPES.contains(&white_color) {
 		return Err(Error::new(ErrorKind::InvalidInput, "32-bit color is not supported"));
 	}
 
@@ -67,45 +69,46 @@ fn preflight_checks(black: &DynamicImage, white: &DynamicImage) -> Result<(), Er
 /// Does Math™ on two input pixels from images with black and white backgrounds
 /// respectively to obtain a "fixed" pixel that includes an alpha channel.
 /// The input pixels are expected to be three-item f32 arrays,
-/// the output pixel is a four-item f64 array.
+/// the output pixel is a four-item f32 array.
 /// Based on the method explained here: <https://www.interact-sw.co.uk/iangblog/2007/01/30/recoveralpha>
-fn magic(black_pixel: [f32; 3], white_pixel: [f32; 3], blend: &Blend) -> [f64; 4] {
+fn recover_alpha(black_pixel: [f32; 3], white_pixel: [f32; 3], blend: &Blend) -> [f32; 4] {
 	let (rb, gb, bb, rw, gw, bw) = (
-		f64::from(black_pixel[0]),
-		f64::from(black_pixel[1]),
-		f64::from(black_pixel[2]),
-		f64::from(white_pixel[0]),
-		f64::from(white_pixel[1]),
-		f64::from(white_pixel[2]),
+		black_pixel[0],
+		black_pixel[1],
+		black_pixel[2],
+		white_pixel[0],
+		white_pixel[1],
+		white_pixel[2],
 	);
 
-	let (alpha, mut rs, mut gs, mut bs) = ((rb - rw + 1.0).clamp(0.0, 1.0), 0.0, 0.0, 0.0);
+	let alpha = (rb - rw + 1.0).clamp(0.0, 1.0);
+	if alpha == 0.0 {
+		return [0.0, 0.0, 0.0, alpha];
+	}
 
-	if alpha > 0.0 {
-		match blend {
-			Blend::White => {
-				rs = rw / alpha;
-				gs = gw / alpha;
-				bs = bw / alpha;
-			}
-			Blend::Black => {
-				rs = rb / alpha;
-				gs = gb / alpha;
-				bs = bb / alpha;
-			}
-			Blend::Mix => {
-				// not actually all that accurate, just in here as an experiment
-				rs = f64::midpoint(rb, rw) / alpha;
-				gs = f64::midpoint(gb, gw) / alpha;
-				bs = f64::midpoint(bb, bw) / alpha;
-			}
+	let (r, g, b);
+
+	match blend {
+		Blend::White => {
+			r = rw / alpha;
+			g = gw / alpha;
+			b = bw / alpha;
+		}
+		Blend::Black => {
+			r = rb / alpha;
+			g = gb / alpha;
+			b = bb / alpha;
+		}
+		Blend::Mix => {
+			// not actually all that accurate, just in here as an experiment
+			r = f32::midpoint(rb, rw) / alpha;
+			g = f32::midpoint(gb, gw) / alpha;
+			b = f32::midpoint(bb, bw) / alpha;
 		}
 	}
 
-	[rs, gs, bs, alpha]
+	[r, g, b, alpha]
 }
-
-const SCALAR: f64 = 65535.0;
 
 fn main() -> Result<(), String> {
 	let args = Args::parse();
@@ -123,12 +126,14 @@ fn main() -> Result<(), String> {
 	preflight_checks(&black_image, &white_image).unwrap();
 
 	let color_type = black_image.color();
-	let format_name = if color_type.has_color() { "RGB" } else { "grayscale" };
 	let bits_per_channel = color_type.bits_per_pixel() / u16::from(color_type.channel_count());
 	let image_dim = black_image.dimensions();
+
 	println!(
-		"Generating {format_name} output at {}×{} with {bits_per_channel} bits per channel…",
-		image_dim.0, image_dim.1
+		"Generating {} output at {}×{} with {bits_per_channel} bits per channel…",
+		if color_type.has_color() { "RGB" } else { "grayscale" },
+		image_dim.0,
+		image_dim.1
 	);
 
 	// Convert the input images to 32-bit RGB so we don't have to worry about integer overflow
@@ -144,13 +149,13 @@ fn main() -> Result<(), String> {
 		.for_each(|(x, y, pixel)| {
 			let bp = black_rgb.get_pixel(x, y).0;
 			let wp = white_rgb.get_pixel(x, y).0;
-			let new = magic(bp, wp, &args.blend);
+			let new = recover_alpha(bp, wp, &args.blend);
 
 			*pixel = image::Rgba([
-				(new[0] * SCALAR) as u16,
-				(new[1] * SCALAR) as u16,
-				(new[2] * SCALAR) as u16,
-				(new[3] * SCALAR) as u16,
+				(new[0] * U16_SCALAR).round() as u16,
+				(new[1] * U16_SCALAR).round() as u16,
+				(new[2] * U16_SCALAR).round() as u16,
+				(new[3] * U16_SCALAR).round() as u16,
 			]);
 		});
 
@@ -178,7 +183,7 @@ fn main() -> Result<(), String> {
 		}
 		_ => {
 			return Err(
-				"congrats, you hit an edge case! encountering {color_type:?} here shouldn't have been possible."
+				"Congrats, you hit an edge case! Encountering {color_type:?} here shouldn't have been possible."
 					.parse()
 					.unwrap(),
 			);
